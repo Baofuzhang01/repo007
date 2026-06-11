@@ -79,20 +79,62 @@ def _wait_until(
         return
 
 
-def _fire_and_forget_warm_connection(s, url: str, timeout_s: float) -> None:
-    """Dispatch connection pre-warm in the background and never wait for it."""
-    def _worker():
-        try:
-            s.warm_connection(url, timeout=timeout_s, quiet=True)
-        except Exception:
-            pass
-
-    t = threading.Thread(target=_worker, daemon=True, name="connection-prewarm")
-    t.start()
+def _warm_connection_before_token(s, url: str, timeout_s: float) -> None:
+    """Finish page pre-warm before the formal token window; always discard its page token."""
+    try:
+        s.warm_connection(url, timeout=timeout_s, quiet=True)
+    except Exception:
+        pass
     logging.info(
-        "[warm] Fire-and-forget connection pre-warm dispatched, timeout=%dms",
+        "[warm] Page pre-warm finished before token window, timeout=%dms; response discarded",
         int(max(0.001, float(timeout_s)) * 1000),
     )
+
+
+def _try_page_prewarm_with_full_window(
+    s,
+    url: str,
+    request_nodes,
+    *,
+    not_before: datetime.datetime | None = None,
+) -> bool:
+    """Run one 4-second page pre-warm only when the next pending request node is far enough."""
+    now = _beijing_now()
+    if not request_nodes:
+        logging.info("[warm] Skip connection pre-warm because no pending request node was provided")
+        return True
+
+    nearest_node_name, nearest_node_dt = min(request_nodes, key=lambda item: item[1])
+    planned_start_dt = max(now, not_before) if not_before is not None else now
+    warm_budget_s = (nearest_node_dt - planned_start_dt).total_seconds()
+    if warm_budget_s < 4.0:
+        logging.info(
+            "[warm] Skip connection pre-warm because its planned start leaves only %.0fms "
+            "before %s request node; a full 4000ms warm window is required",
+            warm_budget_s * 1000,
+            nearest_node_name,
+        )
+        return True
+
+    if not_before is not None:
+        _wait_until(not_before)
+
+    remaining_s = (nearest_node_dt - _beijing_now()).total_seconds()
+    if remaining_s < 4.0:
+        logging.info(
+            "[warm] Skip connection pre-warm after waiting because only %.0fms remain before "
+            "%s request node; a full 4000ms warm window is required",
+            remaining_s * 1000,
+            nearest_node_name,
+        )
+        return True
+
+    logging.info(
+        "[warm] Dispatch connection pre-warm with full 4000ms window before "
+        f"{nearest_node_name} request node; budget {remaining_s * 1000:.0f}ms"
+    )
+    _warm_connection_before_token(s, url, timeout_s=4.0)
+    return True
 
 
 from utils import AES_Decrypt, reserve, get_user_credentials
@@ -618,13 +660,13 @@ def _get_page_token_until_success(
 def _burst_shot_worker(
     index, offset_ms, target_dt, s, token_url,
     times, roomid, seatid, captcha, action, results,
-    pre_token="", pre_value="", use_custom_day=False, day="", fid_enc=""
+    token_submit_lock, use_custom_day=False, day="", fid_enc=""
 ):
     """定时连发（极限型）的单次提交工作线程。
 
     在 target_dt + offset_ms 时刻提交预约，结果写入 results[index]。
-    若传入 pre_token/pre_value（主线程预取），则直接使用，跳过 GET 请求；
-    否则在发射时刻现场获取（有网络延迟）。
+    页面 submit_enc/value 只能使用一次，且刷新页面会使之前获取的值失效。
+    因此每枪都必须在锁内获取新 token/value 并立即 POST，禁止并发刷新或复用。
     """
     fire_dt = target_dt + datetime.timedelta(milliseconds=offset_ms)
     _wait_until(fire_dt)
@@ -640,12 +682,7 @@ def _burst_shot_worker(
         results[index] = False
         return
 
-    if pre_token:
-        token, value = pre_token, pre_value
-        logging.info(
-            f"[burst] Shot {index + 1} using pre-fetched token from {token_url}: {token}"
-        )
-    else:
+    with token_submit_lock:
         token, value = s._get_page_token(
             token_url,
             require_value=True,
@@ -657,26 +694,18 @@ def _burst_shot_worker(
         logging.info(
             f"[burst] Shot {index + 1} fetched token on-the-fly from {token_url}: {token}"
         )
-        s.post_getusedtimes_after_token(
-            times,
-            roomid,
-            seatid,
-            day,
-            fid_enc=fid_enc,
+        result = s.get_submit(
+            url=s.submit_url,
+            times=times,
+            token=token,
+            roomid=roomid,
+            seatid=seatid,
+            captcha=captcha,
+            action=action,
+            value=value,
+            dept_id_enc=fid_enc,
+            use_custom_day=use_custom_day,
         )
-
-    result = s.get_submit(
-        url=s.submit_url,
-        times=times,
-        token=token,
-        roomid=roomid,
-        seatid=seatid,
-        captcha=captcha,
-        action=action,
-        value=value,
-        dept_id_enc=fid_enc,
-        use_custom_day=use_custom_day,
-    )
     results[index] = result
     logging.info(f"[burst] Shot {index + 1} result: {result}")
 
@@ -937,21 +966,47 @@ def strategic_first_attempt(
             shared_strategy_session = s
             shared_strategy_username = username
 
-            # 验证码预热整体预算：最多占用 [T-slider_lead_seconds_range(ms), T] 这段时间。
-            # 选字验证码需要先为连接预热让出时间，后面会在首枪取 token 前再做一次硬保证。
-            captcha_deadline = target_dt
-            if ENABLE_TEXTCLICK and WARM_CONNECTION_LEAD_MS > 0:
-                captcha_deadline = target_dt - datetime.timedelta(
-                    milliseconds=WARM_CONNECTION_LEAD_MS
+            captcha_start_dt = target_dt - datetime.timedelta(
+                milliseconds=STRATEGY_SLIDER_LEAD_MS
+            )
+            warm_dt = target_dt - datetime.timedelta(
+                milliseconds=WARM_CONNECTION_LEAD_MS
+            )
+            first_token_start_dt = _get_first_token_start_dt(target_dt)
+            early_warm_url = s.url.format(
+                roomId=roomid,
+                day=warm_day,
+                seatPageId=seat_page_id or "",
+                fidEnc=fid_enc or "",
+            )
+
+            # 某些学校把页面预热配置在验证码之前；按配置时间顺序真正先执行预热。
+            if (
+                not warm_done
+                and WARM_CONNECTION_LEAD_MS > 0
+                and (ENABLE_ROTATE or ENABLE_SLIDER or ENABLE_TEXTCLICK)
+                and warm_dt <= captcha_start_dt
+            ):
+                warm_done = _try_page_prewarm_with_full_window(
+                    s,
+                    early_warm_url,
+                    [
+                        ("captcha", captcha_start_dt),
+                        ("probe/token", first_token_start_dt),
+                    ],
+                    not_before=warm_dt,
                 )
+
+            # 验证码预热整体预算：最多占用 [T-slider_lead_seconds_range(ms), T] 这段时间。
+            # 验证码不为页面预热提前让出时间；页面预热窗口不足时由页面预热自行跳过。
+            captcha_deadline = target_dt
 
             def _remaining_captcha_seconds() -> float:
                 return (captcha_deadline - _beijing_now()).total_seconds()
 
             # 2. 按毫秒提前量等待，统一预热滑块、选字或旋转滑块验证码。
             if ENABLE_ROTATE or ENABLE_SLIDER or ENABLE_TEXTCLICK:
-                ten_before = target_dt - datetime.timedelta(milliseconds=STRATEGY_SLIDER_LEAD_MS)
-                _wait_until(ten_before)
+                _wait_until(captcha_start_dt)
 
             if ENABLE_ROTATE:
                 captcha_results = {1: "", 2: "", 3: ""}
@@ -1152,7 +1207,7 @@ def strategic_first_attempt(
                     deadline_mono = time.monotonic() + remaining
                     logging.info(
                         "[strategic] Preheat textclick captcha1 until it has validate "
-                        "or reaches the pre-warm hard deadline"
+                        "or reaches the target-time captcha deadline"
                     )
                     textclick_preheat_thread = threading.Thread(
                         target=_worker,
@@ -1304,6 +1359,7 @@ def strategic_first_attempt(
                 f"[strategic] {reason}; immediately resolve a fresh textclick captcha "
                 f"for submit shot {shot_idx} and replace the reused preheated captcha"
             )
+            captchas_for_submit[list_idx] = ""
             captcha = _resolve_textclick_with_retries(
                 s,
                 f"submit shot {shot_idx}",
@@ -1334,6 +1390,7 @@ def strategic_first_attempt(
                 f"[strategic] {reason}; immediately resolve a fresh rotate captcha "
                 f"for submit shot {shot_idx} and replace the reused preheated captcha"
             )
+            captchas_for_submit[list_idx] = ""
             captcha = _resolve_single_captcha_until_success(
                 s,
                 "rotate",
@@ -1347,18 +1404,45 @@ def strategic_first_attempt(
                     f"[strategic] Failed to prepare rotate captcha for submit shot {shot_idx}"
                 )
 
+        def _prepare_slide_captcha_for_submit(shot_idx: int, reason: str):
+            if not ENABLE_SLIDER:
+                return
+
+            _refresh_submit_captchas_from_live_results()
+            list_idx = shot_idx - 1
+            if not (0 <= list_idx < len(captchas_for_submit)):
+                return
+
+            logging.info(
+                f"[strategic] {reason}; immediately resolve a fresh slide captcha "
+                f"for submit shot {shot_idx} and replace any preheated captcha"
+            )
+            captchas_for_submit[list_idx] = ""
+            captcha = s.resolve_captcha("slide") or ""
+            if captcha:
+                captchas_for_submit[list_idx] = captcha
+            else:
+                logging.warning(
+                    f"[strategic] Failed to prepare slide captcha for submit shot {shot_idx}"
+                )
+
+        def _prepare_fresh_captcha_for_submit(shot_idx: int, reason: str, *, max_retries=None):
+            _prepare_textclick_captcha_for_submit(
+                shot_idx,
+                reason,
+                max_retries=max_retries,
+            )
+            _prepare_rotate_captcha_for_submit(
+                shot_idx,
+                reason,
+                max_retries=max_retries,
+            )
+            _prepare_slide_captcha_for_submit(shot_idx, reason)
+
         def _last_submit_failure_msg() -> str:
             if not isinstance(s.last_submit_result, dict):
                 return ""
             return str(s.last_submit_result.get("msg", ""))
-
-        def _last_submit_failed_by_captcha() -> bool:
-            if isinstance(s.last_submit_result, dict) and s.last_submit_result.get(
-                "requires_fresh_credentials"
-            ):
-                return True
-            msg = _last_submit_failure_msg()
-            return "验证码" in msg or "captcha" in msg.lower()
 
         def _get_submit_captcha(shot_idx: int) -> str | None:
             if not captcha_required:
@@ -1483,19 +1567,16 @@ def strategic_first_attempt(
         if sessions is not None and sessions[index] is None:
             sessions[index] = s
 
-        # 连接预热始终使用当天页面；
-        # 自定义日期模式下，首次 token / submit 使用最终提交日；
-        # 普通时间段则保留原有 first_token_date_mode 逻辑。
-        _warm_url = s.url.format(
-            roomId=roomid,
-            day=warm_day,
-            seatPageId=seat_page_id or "",
-            fidEnc=fid_enc or "",
-        )
-
         _first_token_url = s.url.format(
             roomId=roomid,
             day=first_token_day,
+            seatPageId=seat_page_id or "",
+            fidEnc=fid_enc or "",
+        )
+        # 预热仍使用当天页面；响应内容和其中的页面 token 永远丢弃。
+        _warm_url = s.url.format(
+            roomId=roomid,
+            day=warm_day,
             seatPageId=seat_page_id or "",
             fidEnc=fid_enc or "",
         )
@@ -1673,48 +1754,18 @@ def strategic_first_attempt(
 
         # 连接预热：只有首个配置执行一次，后续配置直接复用已预热的连接池
         if is_primary_strategy_config and not warm_done:
-            if _beijing_now() < target_dt:
-                warm_dt = target_dt - datetime.timedelta(
-                    milliseconds=WARM_CONNECTION_LEAD_MS
-                )
-                _wait_until(warm_dt)
-                if ENABLE_TEXTCLICK:
-                    _refresh_submit_captchas_from_live_results()
-                    if (
-                        not captchas_for_submit[0]
-                        and textclick_preheat_thread is not None
-                        and textclick_preheat_thread.is_alive()
-                    ):
-                        logging.info(
-                            "[warm] Skip connection pre-warm because textclick captcha "
-                            "preheat is still waiting for validate"
-                        )
-                        warm_done = True
-                    elif not captchas_for_submit[0]:
-                        logging.info(
-                            "[warm] Skip connection pre-warm because textclick captcha "
-                            "is not ready yet"
-                        )
-                        warm_done = True
-                if warm_done:
-                    pass
-                else:
-                    first_token_start_dt = _get_first_token_start_dt(target_dt)
-                    warm_budget_s = (first_token_start_dt - _beijing_now()).total_seconds()
-                    if warm_budget_s <= 0:
-                        logging.info(
-                            "[warm] Skip connection pre-warm because token window is already due"
-                        )
-                        warm_done = True
-                    else:
-                        warm_timeout_s = min(5.0, max(0.001, warm_budget_s))
-                        logging.info(
-                            "[warm] Dispatch connection pre-warm before first probe/token window: "
-                            f"budget {warm_budget_s * 1000:.0f}ms; background timeout "
-                            f"{warm_timeout_s * 1000:.0f}ms"
-                        )
-                        _fire_and_forget_warm_connection(s, _warm_url, timeout_s=warm_timeout_s)
-                        warm_done = True
+            warm_dt = target_dt - datetime.timedelta(
+                milliseconds=WARM_CONNECTION_LEAD_MS
+            )
+            # 后置页面预热只会在验证码流程结束后执行；此时仅判断距离首个
+            # 轻探测/正式 token 请求是否还具备完整 4 秒窗口。
+            first_token_start_dt = _get_first_token_start_dt(target_dt)
+            warm_done = _try_page_prewarm_with_full_window(
+                s,
+                _warm_url,
+                [("probe/token", first_token_start_dt)],
+                not_before=warm_dt,
+            )
 
         skip_first_strategic_submit = not _ensure_textclick_captcha1_before_strategic_token()
         use_serial_followups = skip_first_strategic_submit and SUBMIT_MODE == "burst"
@@ -1727,81 +1778,53 @@ def strategic_first_attempt(
         if SUBMIT_MODE == "burst" and not use_serial_followups:
             # ── 定时连发（极限型）──
             n_shots = len(BURST_OFFSETS_MS)
+            for shot_idx in range(2, n_shots + 1):
+                _prepare_fresh_captcha_for_submit(
+                    shot_idx,
+                    "Burst shots must use independent captcha values because every reservation POST consumes one",
+                    max_retries=None,
+                )
             captchas_list = (
                 captchas_for_submit + [""] * max(0, n_shots - len(captchas_for_submit))
             )[:n_shots]
 
-            if STRATEGIC_MODE == "C":
-                # ── 策略 C + burst：等到 T + TOKEN_FETCH_DELAY_MS 取一次 token，复用给所有线程 ──
-                fetch_dt = target_dt + datetime.timedelta(milliseconds=TOKEN_FETCH_DELAY_MS)
-                _wait_until(fetch_dt)
-                logging.info(
-                    f"[strategic] [burst-C] Fetching single reusable token at {_beijing_now()} "
-                    f"(target_dt + {TOKEN_FETCH_DELAY_MS}ms) from {_first_token_url}"
-                )
-                pt, pv = s._get_page_token(_first_token_url, require_value=True)
-                if pt:
-                    logging.info(f"[strategic] [burst-C] Got token from {_first_token_url}: {pt}")
-                    s.post_getusedtimes_after_token(
-                        times,
-                        roomid,
-                        first_seat,
-                        submit_day,
-                        fid_enc=fid_enc,
-                    )
-                else:
-                    logging.warning("[strategic] [burst-C] Token fetch failed, threads will fetch on-the-fly")
-                pre_tokens = [(pt, pv)] * n_shots
-
-            elif STRATEGIC_MODE == "A":
-                # 策略 A + burst：主线程在 T - PRE_FETCH_TOKEN_MS 提前取 1 份 token，
-                # 所有线程共用同一份，到点直接 POST，零 GET 延迟
-                burst_prefetch_dt = target_dt - datetime.timedelta(milliseconds=PRE_FETCH_TOKEN_MS)
-                if _beijing_now() < burst_prefetch_dt:
-                    logging.info(
-                        f"[strategic] [burst-A] Waiting until target_dt - {PRE_FETCH_TOKEN_MS}ms "
-                        f"({burst_prefetch_dt}) to pre-fetch token"
-                    )
-                    _wait_until(burst_prefetch_dt)
-
-                logging.info(
-                    f"[strategic] [burst-A] Pre-fetching 1 shared token at {_beijing_now()} from {_first_token_url}"
-                )
-                pt, pv = s._get_page_token(_first_token_url, require_value=True)
-                if pt:
-                    logging.info(f"[strategic] [burst-A] Pre-fetched shared token from {_first_token_url}: {pt}")
-                    s.post_getusedtimes_after_token(
-                        times,
-                        roomid,
-                        first_seat,
-                        submit_day,
-                        fid_enc=fid_enc,
-                    )
-                else:
-                    logging.warning(
-                        "[strategic] [burst-A] Token pre-fetch failed, "
-                        "threads will fetch on-the-fly as fallback"
-                    )
-                pre_tokens = [(pt, pv)] * n_shots
-            else:
-                # 策略 B + burst：不预取，各线程在各自的发射时刻（T + offset）自己取 token 并立即提交
-                logging.info(
-                    f"[strategic] [burst-B] No pre-fetch; each thread will fetch token "
-                    "on-the-fly at its own fire time"
-                )
-                pre_tokens = [("", "")] * n_shots
+            first_burst_conflict = s.check_getusedtimes_conflict_sync(
+                times,
+                roomid,
+                first_seat,
+                submit_day,
+                fid_enc=fid_enc,
+            )
+            first_burst_handle = {"conflict": first_burst_conflict}
+            burst_room, burst_seat, burst_page_id, burst_fid, _, _ = _maybe_switch_to_backup(
+                first_burst_handle,
+                "",
+                "",
+                "first burst submit",
+                1,
+            )
+            burst_token_url = s.url.format(
+                roomId=burst_room,
+                day=submit_day,
+                seatPageId=burst_page_id or burst_room,
+                fidEnc=burst_fid or "",
+            )
+            token_submit_lock = threading.Lock()
+            logging.info(
+                "[strategic] [burst] Only the first shot performs seat conflict selection; "
+                "all shots fetch a fresh one-time page token/value inside the token-submit lock"
+            )
 
             burst_results = [None] * n_shots
             threads = []
             for burst_i, burst_offset_ms in enumerate(BURST_OFFSETS_MS):
                 burst_cap = captchas_list[burst_i] if burst_i < len(captchas_list) else ""
-                pt, pv = pre_tokens[burst_i] if burst_i < len(pre_tokens) else ("", "")
                 t = threading.Thread(
                     target=_burst_shot_worker,
                     args=(
-                        burst_i, burst_offset_ms, target_dt, s, _submit_token_url,
-                        times, roomid, first_seat, burst_cap, action, burst_results,
-                        pt, pv, use_custom_day, submit_day, fid_enc,
+                        burst_i, burst_offset_ms, target_dt, s, burst_token_url,
+                        times, burst_room, burst_seat, burst_cap, action, burst_results,
+                        token_submit_lock, use_custom_day, submit_day, burst_fid,
                     ),
                     daemon=True,
                     name=f"burst-shot-{burst_i + 1}",
@@ -1825,6 +1848,31 @@ def strategic_first_attempt(
         else:
             # ── 串行重试（稳健型）──
             # 每枪等到 HTTP 响应后，失败才发下一枪
+            serial_submitted_shots = set()
+            serial_target_room = roomid
+            serial_target_seat = first_seat
+            serial_target_page_id = seat_page_id
+            serial_target_fid = fid_enc
+            serial_target_token_url = _submit_token_url
+
+            def _serial_get_submit(shot_idx: int, **kwargs):
+                serial_submitted_shots.add(shot_idx)
+                return s.get_submit(**kwargs)
+
+            def _remember_serial_target(submit_room, submit_seat, submit_page_id, submit_fid):
+                nonlocal serial_target_room, serial_target_seat
+                nonlocal serial_target_page_id, serial_target_fid, serial_target_token_url
+                serial_target_room = submit_room
+                serial_target_seat = submit_seat
+                serial_target_page_id = submit_page_id
+                serial_target_fid = submit_fid
+                serial_target_token_url = s.url.format(
+                    roomId=submit_room,
+                    day=submit_day,
+                    seatPageId=submit_page_id or submit_room,
+                    fidEnc=submit_fid or "",
+                )
+
             if skip_first_strategic_submit:
                 logging.warning(
                     "[strategic] First submit skipped because captcha1 missed hard deadline; "
@@ -1862,18 +1910,20 @@ def strategic_first_attempt(
                     submit_day,
                     fid_enc=fid_enc,
                 )
-                submit_room, submit_seat, _, submit_fid, token1, value1 = _maybe_switch_to_backup(
+                submit_room, submit_seat, submit_page_id, submit_fid, token1, value1 = _maybe_switch_to_backup(
                     used_handle1,
                     token1,
                     value1,
                     "first submit",
                     1,
                 )
+                _remember_serial_target(submit_room, submit_seat, submit_page_id, submit_fid)
                 submit_captcha1 = _get_submit_captcha(1)
                 if submit_captcha1 is None:
                     suc = False
                 else:
-                    suc = s.get_submit(
+                    suc = _serial_get_submit(
+                        1,
                         url=s.submit_url,
                         times=times,
                         token=token1,
@@ -1921,18 +1971,20 @@ def strategic_first_attempt(
                 logging.info(
                     f"[strategic] [A] First submit at {_beijing_now()} (target_dt + {FIRST_SUBMIT_OFFSET_MS}ms)"
                 )
-                submit_room, submit_seat, _, submit_fid, token1, value1 = _maybe_switch_to_backup(
+                submit_room, submit_seat, submit_page_id, submit_fid, token1, value1 = _maybe_switch_to_backup(
                     used_handle1,
                     token1,
                     value1,
                     "first submit",
                     1,
                 )
+                _remember_serial_target(submit_room, submit_seat, submit_page_id, submit_fid)
                 submit_captcha1 = _get_submit_captcha(1)
                 if submit_captcha1 is None:
                     suc = False
                 else:
-                    suc = s.get_submit(
+                    suc = _serial_get_submit(
+                        1,
                         url=s.submit_url,
                         times=times,
                         token=token1,
@@ -1975,18 +2027,20 @@ def strategic_first_attempt(
                     fid_enc=fid_enc,
                 )
                 logging.info(f"[strategic] [B] Immediately submit after fetching page token")
-                submit_room, submit_seat, _, submit_fid, token1, value1 = _maybe_switch_to_backup(
+                submit_room, submit_seat, submit_page_id, submit_fid, token1, value1 = _maybe_switch_to_backup(
                     used_handle1,
                     token1,
                     value1,
                     "first submit",
                     1,
                 )
+                _remember_serial_target(submit_room, submit_seat, submit_page_id, submit_fid)
                 submit_captcha1 = _get_submit_captcha(1)
                 if submit_captcha1 is None:
                     suc = False
                 else:
-                    suc = s.get_submit(
+                    suc = _serial_get_submit(
+                        1,
                         url=s.submit_url,
                         times=times,
                         token=token1,
@@ -2009,45 +2063,31 @@ def strategic_first_attempt(
                     continue
                 logging.info("[strategic] First submit failed, prepare second submit with NEW page token")
                 first_failure_msg = _last_submit_failure_msg()
-                first_failed_by_captcha = (
-                    skip_first_strategic_submit or _last_submit_failed_by_captcha()
-                )
+                first_submit_sent = 1 in serial_submitted_shots
                 logging.info(
-                    "[strategic] First submit failure reason: %s; captcha_related=%s",
+                    "[strategic] First submit failure reason: %s; submit_sent=%s",
                     (
                         "captcha1 missed hard deadline"
                         if skip_first_strategic_submit
                         else (first_failure_msg or "<empty>")
                     ),
-                    first_failed_by_captcha,
+                    first_submit_sent,
                 )
-                if first_failed_by_captcha:
-                    captcha_retry_limit = 3 if skip_first_strategic_submit else None
-                    _prepare_textclick_captcha_for_submit(
+                if first_submit_sent or skip_first_strategic_submit:
+                    _prepare_fresh_captcha_for_submit(
                         2,
-                        "First submit failed because of captcha",
-                        max_retries=captcha_retry_limit,
-                    )
-                    _prepare_rotate_captcha_for_submit(
-                        2,
-                        "First submit failed because of captcha",
-                        max_retries=captcha_retry_limit,
-                    )
-                elif ENABLE_TEXTCLICK:
-                    logging.info(
-                        "[strategic] First submit did not fail because of captcha; "
-                        "reuse the preheated textclick captcha for second submit"
-                    )
-                elif ENABLE_ROTATE:
-                    logging.info(
-                        "[strategic] First submit did not fail because of captcha; "
-                        "reuse the preheated rotate captcha for second submit"
+                        (
+                            "First submit sent a reservation POST, so its captcha is consumed"
+                            if first_submit_sent
+                            else "First submit was skipped because captcha1 missed the hard deadline"
+                        ),
+                        max_retries=3 if skip_first_strategic_submit else None,
                     )
 
                 if STRATEGIC_MODE == "A":
                     token2, value2 = _get_page_token_until_success(
                         s,
-                        _submit_token_url,
+                        serial_target_token_url,
                         require_value=True,
                         retry_until=target_dt + datetime.timedelta(seconds=40),
                         retry_interval=0.005,
@@ -2055,43 +2095,30 @@ def strategic_first_attempt(
                     )
                 else:
                     token2, value2 = s._get_page_token(
-                        _submit_token_url,
+                        serial_target_token_url,
                         require_value=True,
                     )
                 if not token2:
                     logging.error("[strategic] Failed to get page token for second submit, skip to third/normal flow")
                 else:
-                    used_handle2 = s.post_getusedtimes_after_token(
-                        times,
-                        roomid,
-                        first_seat,
-                        submit_day,
-                        fid_enc=fid_enc,
-                    )
                     logging.info(
-                        "[strategic] Second submit immediately after fetching NEW page token"
-                    )
-                    submit_room, submit_seat, _, submit_fid, token2, value2 = _maybe_switch_to_backup(
-                        used_handle2,
-                        token2,
-                        value2,
-                        "second submit",
-                        2,
+                        "[strategic] Second submit skips seat query and immediately uses NEW captcha + page token"
                     )
                     submit_captcha2 = _get_submit_captcha(2)
                     if submit_captcha2 is None:
                         suc = False
                     else:
-                        suc = s.get_submit(
+                        suc = _serial_get_submit(
+                            2,
                             url=s.submit_url,
                             times=times,
                             token=token2,
-                            roomid=submit_room,
-                            seatid=submit_seat,
+                            roomid=serial_target_room,
+                            seatid=serial_target_seat,
                             captcha=submit_captcha2,
                             action=action,
                             value=value2,
-                            dept_id_enc=submit_fid,
+                            dept_id_enc=serial_target_fid,
                             use_custom_day=use_custom_day,
                         )
 
@@ -2105,72 +2132,50 @@ def strategic_first_attempt(
                     continue
                 logging.info("[strategic] Second submit failed, prepare third submit with NEW page token")
                 second_failure_msg = _last_submit_failure_msg()
-                second_failed_by_captcha = _last_submit_failed_by_captcha()
+                second_submit_sent = 2 in serial_submitted_shots
                 logging.info(
-                    "[strategic] Second submit failure reason: %s; captcha_related=%s",
+                    "[strategic] Second submit failure reason: %s; submit_sent=%s",
                     second_failure_msg or "<empty>",
-                    second_failed_by_captcha,
+                    second_submit_sent,
                 )
-                if second_failed_by_captcha:
-                    _prepare_textclick_captcha_for_submit(
+                if second_submit_sent:
+                    _prepare_fresh_captcha_for_submit(
                         3,
-                        "Second submit failed because of captcha",
+                        "Second submit sent a reservation POST, so its captcha is consumed",
                         max_retries=None,
                     )
-                    _prepare_rotate_captcha_for_submit(
-                        3,
-                        "Second submit failed because of captcha",
-                        max_retries=None,
-                    )
-                elif ENABLE_TEXTCLICK:
+                elif captcha_required and captchas_for_submit[1]:
+                    captchas_for_submit[2] = captchas_for_submit[1]
                     logging.info(
-                        "[strategic] Second submit did not fail because of captcha; "
-                        "reuse the current textclick captcha for third submit"
-                    )
-                elif ENABLE_ROTATE:
-                    logging.info(
-                        "[strategic] Second submit did not fail because of captcha; "
-                        "reuse the current rotate captcha for third submit"
+                        "[strategic] Second submit did not send a reservation POST; "
+                        "reuse its unconsumed fresh captcha for third submit"
                     )
 
                 token3, value3 = s._get_page_token(
-                    _submit_token_url,
+                    serial_target_token_url,
                     require_value=True,
                 )
                 if not token3:
                     logging.error("[strategic] Failed to get page token for third submit, give up strategic submits for this config")
                 else:
-                    used_handle3 = s.post_getusedtimes_after_token(
-                        times,
-                        roomid,
-                        first_seat,
-                        submit_day,
-                        fid_enc=fid_enc,
-                    )
                     logging.info(
-                        "[strategic] Third submit immediately after fetching NEW page token"
-                    )
-                    submit_room, submit_seat, _, submit_fid, token3, value3 = _maybe_switch_to_backup(
-                        used_handle3,
-                        token3,
-                        value3,
-                        "third submit",
-                        3,
+                        "[strategic] Third submit skips seat query and immediately uses NEW captcha + page token"
                     )
                     submit_captcha3 = _get_submit_captcha(3)
                     if submit_captcha3 is None:
                         suc = False
                     else:
-                        suc = s.get_submit(
+                        suc = _serial_get_submit(
+                            3,
                             url=s.submit_url,
                             times=times,
                             token=token3,
-                            roomid=submit_room,
-                            seatid=submit_seat,
+                            roomid=serial_target_room,
+                            seatid=serial_target_seat,
                             captcha=submit_captcha3,
                             action=action,
                             value=value3,
-                            dept_id_enc=submit_fid,
+                            dept_id_enc=serial_target_fid,
                             use_custom_day=use_custom_day,
                         )
 

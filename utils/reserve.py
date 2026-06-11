@@ -9,6 +9,7 @@ import os
 import threading
 from urllib.parse import urlparse, parse_qs, unquote
 from urllib3.exceptions import InsecureRequestWarning
+from urllib3.util import Timeout as Urllib3Timeout
 from requests.adapters import HTTPAdapter
 from .time_utils import get_beijing_date, parse_times_range, resolve_request_day
 
@@ -220,6 +221,8 @@ class reserve:
         self.fail_dict = []
         self.submit_msg = []
         self.last_submit_result = None
+        self._used_submit_values = set()
+        self._used_submit_values_lock = threading.Lock()
         self.requests = requests.session()
         self._office_trace_adapter = OfficeTraceHTTPAdapter(self)
         self.requests.mount("https://office.chaoxing.com/", self._office_trace_adapter)
@@ -616,6 +619,32 @@ class reserve:
         msg = str(self.last_submit_result.get("msg", ""))
         return self._is_terminal_submit_failure(msg)
 
+    def _claim_submit_value(self, value) -> bool:
+        """Claim a one-time page submit_enc/value before sending a reservation POST."""
+        submit_value = str(value or "").strip()
+        if not submit_value:
+            self.last_submit_result = {
+                "success": False,
+                "msg": "页面token为空，需要重新获取token和验证码",
+                "requires_fresh_credentials": True,
+            }
+            logging.error("Block seat submit because page submit_enc/value is empty")
+            return False
+
+        with self._used_submit_values_lock:
+            if submit_value in self._used_submit_values:
+                self.last_submit_result = {
+                    "success": False,
+                    "msg": "页面token已使用，需要重新获取token和验证码",
+                    "requires_fresh_credentials": True,
+                }
+                logging.error(
+                    "Block seat submit because page submit_enc/value has already been used"
+                )
+                return False
+            self._used_submit_values.add(submit_value)
+        return True
+
     def _request_with_retry(
         self,
         method,
@@ -893,12 +922,14 @@ class reserve:
                     f"[warm] Start connection pre-warm request via {url}, "
                     f"timeout={timeout * 1000:.0f}ms"
                 )
-            return self.requests.get(
+            response = self.requests.get(
                 url,
                 verify=False,
-                timeout=timeout,
+                timeout=Urllib3Timeout(total=timeout, connect=timeout, read=timeout),
                 headers={"X-CX-Skip-Trace": "1"},
             )
+            response.close()
+            return response
         except Exception as e:
             if not quiet:
                 logging.warning(f"[warm] Connection pre-warm ignored after error: {e}")
@@ -2161,21 +2192,6 @@ class reserve:
                     seat_page_id=slot_page_id,
                     fid_enc=slot_fid_enc,
                 )
-                # seatengine/select 页面在前端是通过 GET 打开的，这里也使用 GET，
-                # 否则可能拿到的是错误页或不包含 submit_enc 的内容。
-                token, value = self._get_page_token(
-                    page_url,
-                    require_value=True,
-                    method="GET",
-                )
-                logging.info(f"Get token from {page_url}: {token}")
-                # 如果没有拿到 token，通常说明当前会话已失效或页面结构有变，
-                # 不再继续本轮提交，交给外层重新登录/重试。
-                if not token:
-                    logging.warning(
-                        "No submit_enc token fetched, break current submit loop and retry with new session"
-                    )
-                    break
                 # 根据开关决定使用哪种验证码（两种验证码可以同时开启）
                 captcha = ""
                 if self.enable_rotate:
@@ -2217,27 +2233,43 @@ class reserve:
                         time.sleep(self.sleep_time)
                         self.max_attempt -= 1
                         continue
-                    conflict = self.check_getusedtimes_conflict_sync(
-                        normalized_times,
+                # 页面隐藏值只能使用一次，且再次刷新页面会使旧值失效。
+                # 普通抢先准备验证码，再获取最新页面 token/value，之后只查座并立即提交。
+                token, value = self._get_page_token(
+                    page_url,
+                    require_value=True,
+                    method="GET",
+                )
+                logging.info(f"Get token from {page_url}: {token}")
+                if not token:
+                    logging.warning(
+                        "No submit_enc token fetched, break current submit loop and retry with new session"
+                    )
+                    break
+                conflict = self.check_getusedtimes_conflict_sync(
+                    normalized_times,
+                    slot_roomid,
+                    seat,
+                    request_day,
+                    fid_enc=slot_fid_enc,
+                )
+                if conflict is True:
+                    logging.info(
+                        "[submit] Post-credential getusedtimes found seat conflict, "
+                        "discard this captcha/token pair and switch candidate: "
+                        "roomId=%s seatNum=%s day=%s",
                         slot_roomid,
                         seat,
                         request_day,
-                        fid_enc=slot_fid_enc,
                     )
-                    if conflict is True:
-                        logging.info(
-                            "[submit] Textclick post-captcha getusedtimes found seat conflict, switch candidate before submit: roomId=%s seatNum=%s day=%s",
-                            slot_roomid,
-                            seat,
-                            request_day,
-                        )
-                        break
-                    if conflict is None:
-                        logging.info(
-                            "[submit] Textclick post-captcha getusedtimes unknown, continue submit with current candidate: roomId=%s seatNum=%s",
-                            slot_roomid,
-                            seat,
-                        )
+                    break
+                if conflict is None:
+                    logging.info(
+                        "[submit] Post-credential getusedtimes unknown, immediately submit current candidate: "
+                        "roomId=%s seatNum=%s",
+                        slot_roomid,
+                        seat,
+                    )
                 suc = self.get_submit(
                     self.submit_url,
                     times=normalized_times,
@@ -2282,6 +2314,8 @@ class reserve:
             dept_id_enc=dept_id_enc,
             use_custom_day=use_custom_day,
         )
+        if not self._claim_submit_value(value):
+            return False
         # 使用页面上的 submit_enc（value）作为算法值生成 enc
         parm["enc"] = verify_param(parm, value)
         logging.info(f"submit enc: {parm['enc']}")
@@ -2330,6 +2364,8 @@ class reserve:
             dept_id_enc=dept_id_enc,
             use_custom_day=use_custom_day,
         )
+        if not self._claim_submit_value(value):
+            return dict(self.last_submit_result)
         parm["enc"] = verify_param(parm, value)
         data = self._submit_with_fallback(parm, request_name="[burst] seat submit")
         if data is None:

@@ -99,6 +99,12 @@ class ChaojiyingOCR:
             logging.debug("Chaojiying OCR returned no coordinates")
             return None
 
+        pic_id = str(result.get("pic_id") or "").strip()
+        if pic_id:
+            logging.info("Chaojiying OCR succeeded: pic_id=%s", pic_id)
+        else:
+            logging.info("Chaojiying OCR succeeded but response has no pic_id")
+
         return {
             "text": "".join(str(item.get("text") or "") for item in coordinates),
             "coordinates": coordinates,
