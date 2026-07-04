@@ -10,6 +10,12 @@ TULINGCLOUD_MODEL_IDS = {
     "iconclick": "25998073",
 }
 
+JFBYM_TYPE_IDS = {
+    "iconclick": "30104",
+}
+
+JFBYM_TOKEN = "aFJHbbaCY1C7kExhad8DAEluCXRInl-ogUrlRO6fXRM"
+
 
 def normalize_iconclick_ocr_provider(provider: str | None) -> str:
     value = str(provider or "").strip().lower()
@@ -21,6 +27,9 @@ def normalize_iconclick_ocr_provider(provider: str | None) -> str:
         "tulingcloud": "tulingcloud",
         "图灵": "tulingcloud",
         "图灵云": "tulingcloud",
+        "jfbym": "jfbym",
+        "聚福": "jfbym",
+        "聚福别样": "jfbym",
     }
     return aliases.get(value, DEFAULT_ICONCLICK_OCR_PROVIDER)
 
@@ -43,3 +52,12 @@ def normalize_tulingcloud_captcha_type(captcha_type: str | None) -> str:
 def tulingcloud_model_id(captcha_type: str | None) -> str:
     normalized = normalize_tulingcloud_captcha_type(captcha_type)
     return TULINGCLOUD_MODEL_IDS.get(normalized, "")
+
+
+def jfbym_type_id(captcha_type: str | None) -> str:
+    normalized = normalize_tulingcloud_captcha_type(captcha_type)
+    return JFBYM_TYPE_IDS.get(normalized, "")
+
+
+def jfbym_token() -> str:
+    return JFBYM_TOKEN

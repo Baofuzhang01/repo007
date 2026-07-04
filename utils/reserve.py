@@ -14,6 +14,8 @@ from urllib3.util import Timeout as Urllib3Timeout
 from requests.adapters import HTTPAdapter
 from utils.captcha_ocr import (
     DEFAULT_ICONCLICK_OCR_PROVIDER,
+    jfbym_token,
+    jfbym_type_id,
     normalize_iconclick_ocr_provider,
     normalize_tulingcloud_captcha_type,
     tulingcloud_model_id,
@@ -87,6 +89,11 @@ def _get_tulingcloud_config(
             logging.debug(f"Failed to read tulingcloud config from config.json: {e}")
 
     return username, password, tulingcloud_model_id(captcha_type)
+
+
+def _get_jfbym_config(captcha_type: str | None = "iconclick"):
+    """从 captcha_ocr/config.py 获取 jfbym token 和类型 ID。"""
+    return jfbym_token(), jfbym_type_id(captcha_type)
 
 
 def get_date(day_offset: int = 0):
@@ -1288,17 +1295,6 @@ class reserve:
                 time.monotonic() - image_download_started,
                 len(image_response.content),
             )
-            image = cv2.imdecode(
-                np.frombuffer(image_response.content, np.uint8), cv2.IMREAD_COLOR
-            )
-            if image is None:
-                return ""
-            image = image[:180]
-            ok, encoded = cv2.imencode(".jpg", image)
-            if not ok:
-                return ""
-
-            img_bytes = encoded.tobytes()
             if self.iconclick_ocr_provider == "tulingcloud":
                 from utils.captcha_ocr import TulingCloudOCR
 
@@ -1308,14 +1304,39 @@ class reserve:
                 if not all([username, password, model_id]):
                     logging.error("未配置图灵云图标点选所需的账号信息")
                     return ""
-                logging.info("图标点选使用图灵云识别，model_id=%s", model_id)
+                logging.info("图标点选使用图灵云识别，model_id=%s，提交原图", model_id)
                 positions = TulingCloudOCR(
                     username=username,
                     password=password,
                     model_id=model_id,
-                ).recognize_iconclick(img_bytes)
+                ).recognize_iconclick(image_response.content)
+            elif self.iconclick_ocr_provider == "jfbym":
+                from utils.captcha_ocr import JfbymOCR
+
+                token, type_id = _get_jfbym_config("iconclick")
+                if not token:
+                    logging.error("未在 utils/captcha_ocr/config.py 配置 jfbym 图标点选 token")
+                    return ""
+                if not type_id:
+                    logging.error("未在 utils/captcha_ocr/config.py 配置 jfbym 图标点选 type_id")
+                    return ""
+                logging.info("图标点选使用 jfbym 识别，type=%s，提交原图", type_id)
+                positions = JfbymOCR(
+                    token=token,
+                    type_id=type_id,
+                ).recognize_iconclick(image_response.content)
             else:
                 from utils.captcha_ocr import ChaojiyingOCR
+
+                image = cv2.imdecode(
+                    np.frombuffer(image_response.content, np.uint8), cv2.IMREAD_COLOR
+                )
+                if image is None:
+                    return ""
+                image = image[:180]
+                ok, encoded = cv2.imencode(".jpg", image)
+                if not ok:
+                    return ""
 
                 username, password, soft_id, _ = _get_chaojiying_config()
                 if not all([username, password, soft_id]):
@@ -1324,7 +1345,7 @@ class reserve:
                 logging.info("图标点选使用超级鹰 9103 识别")
                 positions = ChaojiyingOCR(
                     username, password, soft_id, codetype=9103
-                ).recognize_iconclick(img_bytes)
+                ).recognize_iconclick(encoded.tobytes())
         except Exception as e:
             logging.warning("图标点选识别失败：%s", e)
             return ""

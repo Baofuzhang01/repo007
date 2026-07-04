@@ -291,7 +291,7 @@ ENABLE_SLIDER = False  # 是否有滑块验证（调试阶段先关闭）
 ENABLE_TEXTCLICK = False  # 是否有选字验证码（默认使用超级鹰打码平台）
 ENABLE_ICONCLICK = False  # 是否有图标点选验证码（超级鹰 9103）
 ENABLE_ROTATE = False  # 是否有旋转滑块验证码（使用图灵云 rotate 模型）
-ICONCLICK_OCR_PROVIDER = "chaojiying"  # 图标点选识别平台：chaojiying / tulingcloud
+ICONCLICK_OCR_PROVIDER = "chaojiying"  # 图标点选识别平台：chaojiying / tulingcloud / jfbym
 SEAT_API_MODE = "seat"  # 页面 token 接口模式：auto / seatengine / seat / seatengine_code / seat_code
 
 FAST_PROBE_START_OFFSET_MS = 14  # 目标时间后多少毫秒开始轻探测
@@ -449,7 +449,7 @@ def _apply_strategy_config(config):
     iconclick_provider = str(config.get("iconclick_ocr_provider", ICONCLICK_OCR_PROVIDER)).strip().lower()
     ICONCLICK_OCR_PROVIDER = (
         iconclick_provider
-        if iconclick_provider in {"chaojiying", "tulingcloud"}
+        if iconclick_provider in {"chaojiying", "tulingcloud", "jfbym"}
         else "chaojiying"
     )
     seat_api_mode = str(config.get("seat_api_mode", SEAT_API_MODE)).strip().lower()
