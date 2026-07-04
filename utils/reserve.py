@@ -2,6 +2,7 @@ from utils import AES_Encrypt, enc, generate_captcha_key, verify_param
 import json
 import requests
 import re
+import secrets
 import time
 import logging
 import datetime
@@ -183,6 +184,7 @@ class reserve:
         max_attempt=50,
         enable_slider=False,
         enable_textclick=False,
+        enable_iconclick=False,
         enable_rotate=False,
         reserve_next_day=False,
         reserve_day_offset=None,
@@ -299,6 +301,7 @@ class reserve:
         self.max_attempt = max_attempt
         self.enable_slider = enable_slider
         self.enable_textclick = enable_textclick
+        self.enable_iconclick = enable_iconclick
         self.enable_rotate = enable_rotate
         self.reserve_next_day = reserve_next_day
         self.reserve_day_offset = reserve_day_offset
@@ -1159,12 +1162,14 @@ class reserve:
         """统一的验证码求解入口。
         
         参数:
-            captcha_type: "slide"（滑块）、"textclick"（选字）或 "rotate"（旋转滑块）
+            captcha_type: "slide"（滑块）、"textclick"（选字）、"iconclick"（图标）或 "rotate"（旋转滑块）
         """
         if captcha_type == "slide":
             return self._resolve_slide_captcha()
         elif captcha_type == "textclick":
             return self._resolve_textclick_captcha()
+        elif captcha_type == "iconclick":
+            return self._resolve_iconclick_captcha()
         elif captcha_type == "rotate":
             return self._resolve_rotate_captcha_with_retry(max_attempts=3)
         else:
@@ -1245,6 +1250,61 @@ class reserve:
         logging.error(
             f"Textclick captcha token remains empty after {attempts} attempts, skip submit to avoid empty captcha"
         )
+        return ""
+
+    def _resolve_iconclick_captcha(self):
+        """裁掉未展示的提示帧，使用超级鹰 9103 识别图标点击顺序。"""
+        captcha_token, captcha_iv, image_url = self.get_iconclick_captcha_data()
+        if not captcha_token or not image_url:
+            logging.warning("Failed to get iconclick captcha payload")
+            return ""
+        try:
+            import cv2
+            import numpy as np
+
+            image_response = self._get(
+                image_url,
+                headers={
+                    "Host": urlparse(image_url).netloc,
+                    "Referer": "https://office.chaoxing.com/",
+                    "User-Agent": self.headers["User-Agent"],
+                },
+                request_name="iconclick image download",
+            )
+            image_response.raise_for_status()
+            image = cv2.imdecode(
+                np.frombuffer(image_response.content, np.uint8), cv2.IMREAD_COLOR
+            )
+            if image is None:
+                return ""
+            image = image[:180]
+            ok, encoded = cv2.imencode(".jpg", image)
+            if not ok:
+                return ""
+
+            from utils.chaojiying_ocr import ChaojiyingOCR
+
+            username, password, soft_id, _ = _get_chaojiying_config()
+            if not all([username, password, soft_id]):
+                logging.error("Chaojiying credentials not configured for iconclick")
+                return ""
+            positions = ChaojiyingOCR(
+                username, password, soft_id, codetype=9103
+            ).recognize_iconclick(encoded.tobytes())
+        except Exception as e:
+            logging.warning("Iconclick recognition failed: %s", e)
+            return ""
+        if not positions:
+            return ""
+        logging.info("Iconclick positions: %s", positions)
+        return self.submit_iconclick_captcha(captcha_token, captcha_iv, positions)
+
+    def _resolve_iconclick_captcha_with_retry(self, max_attempts: int = 2):
+        for attempt in range(1, max(1, int(max_attempts)) + 1):
+            captcha = self._resolve_iconclick_captcha()
+            if captcha:
+                return captcha
+            logging.warning("Iconclick captcha attempt %d failed", attempt)
         return ""
 
     def _resolve_rotate_captcha(self):
@@ -1432,25 +1492,32 @@ class reserve:
         )
         return None
 
-    def _submit_captcha(self, captcha_type, captcha_token, click_array):
+    def _submit_captcha(self, captcha_type, captcha_token, click_array, captcha_iv=""):
         """统一的验证码提交逻辑。
         
         参数:
-            captcha_type: "slide" 或 "textclick"
+            captcha_type: "slide"、"textclick" 或 "iconclick"
             captcha_token: 验证码 token
             click_array: [{"x": x}] 或 [{"x": x1, "y": y1}, ...]
         """
+        callback = (
+            "cx_captcha_function"
+            if captcha_type == "iconclick"
+            else "jQuery33109180509737430778_1716381333117"
+        )
         params = {
-            "callback": "jQuery33109180509737430778_1716381333117",
+            "callback": callback,
             "captchaId": "42sxgHoTPTKbt0uZxPJ7ssOvtXr3ZgZ1",
             "type": captcha_type,
             "token": captcha_token,
             "textClickArr": json.dumps(click_array),
             "coordinate": json.dumps([]),
             "runEnv": "10",
-            "version": "1.1.20" if captcha_type == "textclick" else "1.1.18",
+            "version": "1.1.20" if captcha_type in {"textclick", "iconclick"} else "1.1.18",
             "_": int(time.time() * 1000),
         }
+        if captcha_type == "iconclick":
+            params.update({"t": "a", "iv": captcha_iv})
         logging.debug(f"Submit captcha params: {params}")
         try:
             response = self._get(
@@ -1462,9 +1529,9 @@ class reserve:
         except requests.exceptions.RequestException as e:
             logging.warning(f"Failed to submit {captcha_type} captcha: {e}")
             return ""
-        text = response.text.replace(
-            "jQuery33109180509737430778_1716381333117(", ""
-        ).replace(")", "")
+        text = response.text.strip()
+        if text.startswith(f"{callback}(") and text.endswith(")"):
+            text = text[len(callback) + 1 : -1]
         try:
             data = json.loads(text)
         except ValueError as e:
@@ -1479,6 +1546,12 @@ class reserve:
         except (KeyError, ValueError) as e:
             logging.info("Can't load validate value. Maybe server return mistake.")
             return ""
+
+    def submit_iconclick_captcha(self, captcha_token, captcha_iv, positions):
+        """提交点选图标坐标并返回 validate。"""
+        return self._submit_captcha(
+            "iconclick", captcha_token, positions, captcha_iv=captcha_iv
+        )
 
     def _submit_rotate_captcha(self, captcha_token, captcha_iv, x):
         params = {
@@ -1581,6 +1654,47 @@ class reserve:
         )
         
         return captcha_token, image_url, target_text
+
+    def get_iconclick_captcha_data(self):
+        """获取点选图标验证码的 token、iv 和原图 URL。"""
+        timestamp = int(time.time() * 1000)
+        captcha_key, token = generate_captcha_key(timestamp, captcha_type="iconclick")
+        callback = "cx_captcha_function"
+        captcha_iv = secrets.token_hex(16)
+        params = {
+            "callback": callback,
+            "captchaId": "42sxgHoTPTKbt0uZxPJ7ssOvtXr3ZgZ1",
+            "type": "iconclick",
+            "version": "1.1.20",
+            "captchaKey": captcha_key,
+            "token": token,
+            "referer": self._build_captcha_referer(),
+            "iv": captcha_iv,
+            "_": timestamp,
+        }
+        try:
+            response = self._get(
+                "https://captcha.chaoxing.com/captcha/get/verification/image",
+                params=params,
+                headers=self.headers,
+                request_name="iconclick captcha fetch",
+            )
+        except requests.exceptions.RequestException as e:
+            logging.warning("Failed to fetch iconclick captcha data: %s", e)
+            return "", "", ""
+
+        text = response.text.strip()
+        if text.startswith(f"{callback}(") and text.endswith(")"):
+            text = text[len(callback) + 1 : -1]
+        try:
+            data = json.loads(text)
+        except ValueError as e:
+            logging.error("Failed to parse iconclick captcha payload: %s", e)
+            return "", "", ""
+
+        return data.get("token") or "", captcha_iv, (
+            data.get("imageVerificationVo", {}).get("originImage") or ""
+        )
 
     def get_rotate_captcha_data(self):
         """获取 rotate 验证码数据：token、iv、小圆图、背景挖空图。"""
@@ -2274,7 +2388,7 @@ class reserve:
             }
             for seat in seat_candidates
         ]
-        if self.enable_textclick and isinstance(backup_slots, list):
+        if (self.enable_textclick or self.enable_iconclick) and isinstance(backup_slots, list):
             for backup in backup_slots:
                 if not isinstance(backup, dict):
                     continue
@@ -2363,6 +2477,14 @@ class reserve:
                         )
                         if type(self).textclick_normal_request_count >= type(self).textclick_normal_request_limit:
                             self._abort_textclick_normal_flow_after_limit(type(self).textclick_normal_request_count)
+                        time.sleep(self.sleep_time)
+                        self.max_attempt -= 1
+                        continue
+                elif self.enable_iconclick:
+                    captcha = self._resolve_iconclick_captcha_with_retry(max_attempts=3)
+                    logging.info("Iconclick captcha token: %s", captcha)
+                    if not captcha:
+                        logging.warning("Skip submit because iconclick captcha is empty")
                         time.sleep(self.sleep_time)
                         self.max_attempt -= 1
                         continue

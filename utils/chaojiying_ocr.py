@@ -110,3 +110,38 @@ class ChaojiyingOCR:
             "coordinates": coordinates,
             "raw_result": result,
         }
+
+    def recognize_iconclick(self, img_data: bytes) -> Optional[list[dict]]:
+        """使用 9103 返回按点击顺序排列的 x,y 坐标。"""
+        b64_data = base64.b64encode(img_data).decode("ascii")
+        params = {
+            "user": self.username,
+            "pass2": self.password_md5,
+            "softid": self.soft_id,
+            "codetype": 9103,
+            "file_base64": self._normalize_base64(b64_data),
+        }
+        try:
+            result = requests.post(
+                self.API_URL,
+                data=params,
+                headers=self.headers,
+                timeout=30,
+            ).json()
+        except Exception as e:
+            logging.debug("Chaojiying iconclick request failed: %s", e)
+            return None
+        if int(result.get("err_no") or 0) != 0:
+            logging.debug("Chaojiying iconclick failed: %s", result)
+            return None
+        try:
+            return [
+                {"x": int(float(x)), "y": int(float(y))}
+                for x, y in (
+                    chunk.split(",", 1)
+                    for chunk in str(result.get("pic_str") or "").split("|")
+                )
+            ]
+        except ValueError:
+            logging.debug("Invalid Chaojiying 9103 pic_str: %s", result.get("pic_str"))
+            return None

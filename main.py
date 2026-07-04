@@ -289,6 +289,7 @@ RESERVE_NEXT_DAY = True  # 预约明天而不是今天的
 RESERVE_DAY_OFFSET = None  # 可选：覆盖提交参数 day 的北京时间日期偏移，2 表示后天
 ENABLE_SLIDER = False  # 是否有滑块验证（调试阶段先关闭）
 ENABLE_TEXTCLICK = False  # 是否有选字验证码（默认使用超级鹰打码平台）
+ENABLE_ICONCLICK = False  # 是否有图标点选验证码（超级鹰 9103）
 ENABLE_ROTATE = False  # 是否有旋转滑块验证码（使用图灵云 rotate 模型）
 SEAT_API_MODE = "seat"  # 页面 token 接口模式：auto / seatengine / seat / seatengine_code / seat_code
 
@@ -379,6 +380,7 @@ def _load_runtime_config(config_path, dispatch_mode, action):
             "reserve_day_offset": payload.get("reserve_day_offset"),
             "enable_slider": payload.get("enable_slider", ENABLE_SLIDER),
             "enable_textclick": payload.get("enable_textclick", ENABLE_TEXTCLICK),
+            "enable_iconclick": payload.get("enable_iconclick", ENABLE_ICONCLICK),
             "enable_rotate": payload.get("enable_rotate", ENABLE_ROTATE),
             "relogin_every_loop": False,
         }
@@ -415,6 +417,7 @@ def _apply_strategy_config(config):
     global RESERVE_NEXT_DAY
     global ENABLE_SLIDER
     global ENABLE_TEXTCLICK
+    global ENABLE_ICONCLICK
     global ENABLE_ROTATE
     global STRATEGY_LOGIN_LEAD_SECONDS
     global STRATEGY_SLIDER_LEAD_MS
@@ -438,6 +441,7 @@ def _apply_strategy_config(config):
     RESERVE_DAY_OFFSET = normalize_day_offset(config.get("reserve_day_offset", None))
     ENABLE_SLIDER = bool(config.get("enable_slider", ENABLE_SLIDER))
     ENABLE_TEXTCLICK = bool(config.get("enable_textclick", ENABLE_TEXTCLICK))
+    ENABLE_ICONCLICK = bool(config.get("enable_iconclick", ENABLE_ICONCLICK))
     ENABLE_ROTATE = bool(config.get("enable_rotate", ENABLE_ROTATE))
     seat_api_mode = str(config.get("seat_api_mode", SEAT_API_MODE)).strip().lower()
     SEAT_API_MODE = (
@@ -471,7 +475,7 @@ def _apply_strategy_config(config):
     else:
         STRATEGY_SLIDER_LEAD_MS = int(strategy_cfg.get("slider_lead_seconds", 14)) * 1000
     if (
-        (ENABLE_ROTATE or ENABLE_SLIDER or ENABLE_TEXTCLICK)
+        (ENABLE_ROTATE or ENABLE_SLIDER or ENABLE_TEXTCLICK or ENABLE_ICONCLICK)
         and STRATEGY_SLIDER_LEAD_MS > STRATEGY_LOGIN_LEAD_SECONDS * 1000
     ):
         logging.warning(
@@ -705,7 +709,7 @@ def _burst_shot_worker(
         f"[burst] Shot {index + 1} firing at {_beijing_now()} (target_dt + {offset_ms}ms)"
     )
 
-    if (ENABLE_ROTATE or ENABLE_SLIDER or ENABLE_TEXTCLICK) and not captcha:
+    if (ENABLE_ROTATE or ENABLE_SLIDER or ENABLE_TEXTCLICK or ENABLE_ICONCLICK) and not captcha:
         logging.error(
             f"[burst] Shot {index + 1} has empty captcha, skip submit to avoid empty captcha"
         )
@@ -866,6 +870,7 @@ def strategic_first_attempt(
         captcha1 = captcha2 = captcha3 = ""
         live_captcha_results = None
         textclick_preheat_thread = None
+        click_captcha_type = "iconclick" if ENABLE_ICONCLICK else "textclick"
 
         def _resolve_textclick_with_retries(
             captcha_session,
@@ -879,17 +884,19 @@ def strategic_first_attempt(
                 attempt += 1
                 if deadline_func is not None and deadline_func() <= 0:
                     logging.warning(
-                        f"[strategic] Textclick {label} stopped before success: preheat deadline reached"
+                        f"[strategic] {click_captcha_type} {label} stopped before success: preheat deadline reached"
                     )
                     return ""
                 try:
-                    captcha = captcha_session.resolve_captcha("textclick") or ""
+                    captcha = captcha_session.resolve_captcha(click_captcha_type) or ""
                 except Exception as e:
-                    logging.debug(f"[strategic] Textclick {label} attempt {attempt} raised: {e}")
+                    logging.debug(
+                        f"[strategic] {click_captcha_type} {label} attempt {attempt} raised: {e}"
+                    )
                     captcha = ""
                 if captcha:
                     logging.info(
-                        f"[strategic] Textclick {label} resolved on attempt {attempt}"
+                        f"[strategic] {click_captcha_type} {label} resolved on attempt {attempt}"
                     )
                     return captcha
                 if max_retries is None or attempt < max_retries:
@@ -901,7 +908,7 @@ def strategic_first_attempt(
                             time.sleep(sleep_s)
 
             logging.warning(
-                f"[strategic] Textclick {label} failed after {max_retries} attempts"
+                f"[strategic] {click_captcha_type} {label} failed after {max_retries} attempts"
             )
             return ""
 
@@ -955,6 +962,7 @@ def strategic_first_attempt(
                 max_attempt=MAX_ATTEMPT,
                 enable_slider=ENABLE_SLIDER,
                 enable_textclick=ENABLE_TEXTCLICK,
+                enable_iconclick=ENABLE_ICONCLICK,
                 enable_rotate=ENABLE_ROTATE,
                 reserve_next_day=RESERVE_NEXT_DAY,
                 reserve_day_offset=RESERVE_DAY_OFFSET,
@@ -1018,7 +1026,7 @@ def strategic_first_attempt(
             if (
                 not warm_done
                 and WARM_CONNECTION_LEAD_MS > 0
-                and (ENABLE_ROTATE or ENABLE_SLIDER or ENABLE_TEXTCLICK)
+                and (ENABLE_ROTATE or ENABLE_SLIDER or ENABLE_TEXTCLICK or ENABLE_ICONCLICK)
                 and warm_dt <= captcha_start_dt
             ):
                 warm_done = _try_page_prewarm_with_full_window(
@@ -1038,8 +1046,8 @@ def strategic_first_attempt(
             def _remaining_captcha_seconds() -> float:
                 return (captcha_deadline - _beijing_now()).total_seconds()
 
-            # 2. 按毫秒提前量等待，统一预热滑块、选字或旋转滑块验证码。
-            if ENABLE_ROTATE or ENABLE_SLIDER or ENABLE_TEXTCLICK:
+            # 2. 按毫秒提前量等待，统一预热滑块、选字、图标或旋转滑块验证码。
+            if ENABLE_ROTATE or ENABLE_SLIDER or ENABLE_TEXTCLICK or ENABLE_ICONCLICK:
                 _wait_until(captcha_start_dt)
 
             if ENABLE_ROTATE:
@@ -1055,6 +1063,7 @@ def strategic_first_attempt(
                             max_attempt=MAX_ATTEMPT,
                             enable_slider=ENABLE_SLIDER,
                             enable_textclick=ENABLE_TEXTCLICK,
+                            enable_iconclick=ENABLE_ICONCLICK,
                             enable_rotate=ENABLE_ROTATE,
                             reserve_next_day=RESERVE_NEXT_DAY,
                             reserve_day_offset=RESERVE_DAY_OFFSET,
@@ -1104,6 +1113,7 @@ def strategic_first_attempt(
                         max_attempt=MAX_ATTEMPT,
                         enable_slider=ENABLE_SLIDER,
                         enable_textclick=ENABLE_TEXTCLICK,
+                        enable_iconclick=ENABLE_ICONCLICK,
                         enable_rotate=ENABLE_ROTATE,
                         reserve_next_day=RESERVE_NEXT_DAY,
                         reserve_day_offset=RESERVE_DAY_OFFSET,
@@ -1198,12 +1208,14 @@ def strategic_first_attempt(
                 logging.info(f"[strategic] Pre-resolved {active_captcha_type} captcha1: {captcha1}")
                 logging.info(f"[strategic] Pre-resolved {active_captcha_type} captcha2: {captcha2}")
                 logging.info(f"[strategic] Pre-resolved {active_captcha_type} captcha3: {captcha3}")
-            elif ENABLE_TEXTCLICK:
+            elif ENABLE_TEXTCLICK or ENABLE_ICONCLICK:
                 captcha_results = {1: "", 2: "", 3: ""}
                 live_captcha_results = captcha_results
                 remaining = _remaining_captcha_seconds()
                 if remaining <= 0:
-                    logging.warning("[strategic] Captcha preheat budget exhausted before textclick starts, skip preheat")
+                    logging.warning(
+                        f"[strategic] Captcha preheat budget exhausted before {click_captcha_type} starts, skip preheat"
+                    )
                 else:
                     def _make_textclick_worker():
                         worker = reserve(
@@ -1211,6 +1223,7 @@ def strategic_first_attempt(
                             max_attempt=MAX_ATTEMPT,
                             enable_slider=ENABLE_SLIDER,
                             enable_textclick=ENABLE_TEXTCLICK,
+                            enable_iconclick=ENABLE_ICONCLICK,
                             enable_rotate=ENABLE_ROTATE,
                             reserve_next_day=RESERVE_NEXT_DAY,
                             reserve_day_offset=RESERVE_DAY_OFFSET,
@@ -1235,17 +1248,19 @@ def strategic_first_attempt(
                                 deadline_func=_remaining_captcha_seconds,
                             ) or ""
                         except Exception as e:
-                            logging.warning(f"[strategic] Textclick captcha1 preheat thread failed: {e}")
+                            logging.warning(
+                                f"[strategic] {click_captcha_type} captcha1 preheat thread failed: {e}"
+                            )
                             captcha_results[1] = ""
 
                     deadline_mono = time.monotonic() + remaining
                     logging.info(
-                        "[strategic] Preheat textclick captcha1 until it has validate "
+                        f"[strategic] Preheat {click_captcha_type} captcha1 until it has validate "
                         "or reaches the target-time captcha deadline"
                     )
                     textclick_preheat_thread = threading.Thread(
                         target=_worker,
-                        name="textclick-captcha-1",
+                        name=f"{click_captcha_type}-captcha-1",
                         daemon=True,
                     )
                     textclick_preheat_thread.start()
@@ -1257,7 +1272,7 @@ def strategic_first_attempt(
                 captcha2 = ""
                 captcha3 = ""
                 logging.info(
-                    "[strategic] Pre-resolved textclick captcha ready: %s",
+                    f"[strategic] Pre-resolved {click_captcha_type} captcha ready: %s",
                     bool(captcha1),
                 )
         else:
@@ -1294,9 +1309,9 @@ def strategic_first_attempt(
                 captcha1 = s.resolve_captcha(active_captcha_type) or ""
                 captcha2 = s.resolve_captcha(active_captcha_type) or ""
                 captcha3 = s.resolve_captcha(active_captcha_type) or ""
-            elif ENABLE_TEXTCLICK:
+            elif ENABLE_TEXTCLICK or ENABLE_ICONCLICK:
                 logging.info(
-                    "[strategic] Captcha preheat skipped for this config; resolve one textclick captcha first"
+                    f"[strategic] Captcha preheat skipped for this config; resolve one {click_captcha_type} captcha first"
                 )
                 captcha1 = _resolve_textclick_with_retries(
                     s,
@@ -1306,10 +1321,20 @@ def strategic_first_attempt(
                 captcha2 = ""
                 captcha3 = ""
 
-        captcha_required = bool(ENABLE_ROTATE or ENABLE_SLIDER or ENABLE_TEXTCLICK)
-        captcha_type = "rotate" if ENABLE_ROTATE else ("slide" if ENABLE_SLIDER else "textclick")
+        captcha_required = bool(
+            ENABLE_ROTATE or ENABLE_SLIDER or ENABLE_TEXTCLICK or ENABLE_ICONCLICK
+        )
+        captcha_type = (
+            "rotate"
+            if ENABLE_ROTATE
+            else "slide"
+            if ENABLE_SLIDER
+            else "iconclick"
+            if ENABLE_ICONCLICK
+            else "textclick"
+        )
         raw_captchas = [captcha1, captcha2, captcha3]
-        if (ENABLE_TEXTCLICK or ENABLE_ROTATE) and captcha1:
+        if (ENABLE_TEXTCLICK or ENABLE_ICONCLICK or ENABLE_ROTATE) and captcha1:
             captchas_for_submit = [captcha1, captcha1, captcha1]
             logging.info(
                 f"[strategic] Reuse one preheated {captcha_type} captcha for the first three submits"
@@ -1317,7 +1342,7 @@ def strategic_first_attempt(
         else:
             captchas_for_submit = [captcha for captcha in raw_captchas if captcha]
         expected_single_reused_captcha = bool(
-            (ENABLE_TEXTCLICK or ENABLE_ROTATE)
+            (ENABLE_TEXTCLICK or ENABLE_ICONCLICK or ENABLE_ROTATE)
             and captchas_for_submit
             and raw_captchas[0]
             and not raw_captchas[1]
@@ -1345,7 +1370,7 @@ def strategic_first_attempt(
             if not captcha_required or not live_captcha_results:
                 return
 
-            if ENABLE_TEXTCLICK or ENABLE_ROTATE:
+            if ENABLE_TEXTCLICK or ENABLE_ICONCLICK or ENABLE_ROTATE:
                 live_first = live_captcha_results.get(1, "")
                 if live_first and not captchas_for_submit[0]:
                     captchas_for_submit[:] = [live_first, live_first, live_first]
@@ -1381,7 +1406,7 @@ def strategic_first_attempt(
             *,
             max_retries: int | None = 3,
         ):
-            if not ENABLE_TEXTCLICK:
+            if not (ENABLE_TEXTCLICK or ENABLE_ICONCLICK):
                 return
 
             _refresh_submit_captchas_from_live_results()
@@ -1390,7 +1415,7 @@ def strategic_first_attempt(
                 return
 
             logging.info(
-                f"[strategic] {reason}; immediately resolve a fresh textclick captcha "
+                f"[strategic] {reason}; immediately resolve a fresh {click_captcha_type} captcha "
                 f"for submit shot {shot_idx} and replace the reused preheated captcha"
             )
             captchas_for_submit[list_idx] = ""
@@ -1403,7 +1428,7 @@ def strategic_first_attempt(
                 captchas_for_submit[list_idx] = captcha
             else:
                 logging.warning(
-                    f"[strategic] Failed to prepare textclick captcha for submit shot {shot_idx}"
+                    f"[strategic] Failed to prepare {click_captcha_type} captcha for submit shot {shot_idx}"
                 )
 
         def _prepare_rotate_captcha_for_submit(
@@ -1492,7 +1517,7 @@ def strategic_first_attempt(
             if captcha:
                 return captcha
 
-            if (ENABLE_TEXTCLICK or ENABLE_ROTATE) and shot_idx == 1:
+            if (ENABLE_TEXTCLICK or ENABLE_ICONCLICK or ENABLE_ROTATE) and shot_idx == 1:
                 logging.error(
                     f"[strategic] {captcha_type} captcha1 is still empty when submit shot 1 needs it; "
                     "skip this strategic submit instead of resolving after token fetch"
@@ -1503,7 +1528,7 @@ def strategic_first_attempt(
                 f"[strategic] Captcha for submit shot {shot_idx} is empty, "
                 f"resolve {captcha_type} captcha on demand before submit"
             )
-            if ENABLE_TEXTCLICK:
+            if ENABLE_TEXTCLICK or ENABLE_ICONCLICK:
                 captcha = _resolve_textclick_with_retries(
                     s,
                     f"submit shot {shot_idx} fallback",
@@ -1527,7 +1552,7 @@ def strategic_first_attempt(
             return None
 
         def _ensure_textclick_captcha1_before_strategic_token() -> bool:
-            if not (ENABLE_TEXTCLICK or ENABLE_ROTATE):
+            if not (ENABLE_TEXTCLICK or ENABLE_ICONCLICK or ENABLE_ROTATE):
                 return True
 
             _refresh_submit_captchas_from_live_results()
@@ -1544,14 +1569,14 @@ def strategic_first_attempt(
                 )
 
                 if (
-                    ENABLE_TEXTCLICK
+                    (ENABLE_TEXTCLICK or ENABLE_ICONCLICK)
                     and
                     textclick_preheat_thread is not None
                     and textclick_preheat_thread.is_alive()
                 ):
                     wait_s = max(0.0, (hard_deadline - _beijing_now()).total_seconds())
                     logging.info(
-                        "[strategic] Textclick preheat thread is still running; "
+                        f"[strategic] {click_captcha_type} preheat thread is still running; "
                         "wait for existing captcha request before starting another"
                     )
                     textclick_preheat_thread.join(timeout=wait_s)
@@ -1566,7 +1591,7 @@ def strategic_first_attempt(
                 def _remaining_first_captcha_seconds() -> float:
                     return (hard_deadline - _beijing_now()).total_seconds()
 
-                if ENABLE_TEXTCLICK:
+                if ENABLE_TEXTCLICK or ENABLE_ICONCLICK:
                     captcha = _resolve_textclick_with_retries(
                         s,
                         "captcha1 pre-token guarantee",
@@ -1576,7 +1601,7 @@ def strategic_first_attempt(
                 else:
                     captcha = _resolve_single_captcha_until_success(
                         s,
-                        "rotate",
+                        captcha_type,
                         "captcha1 pre-token guarantee",
                         max_retries=None,
                         deadline_func=_remaining_first_captcha_seconds,
@@ -1625,7 +1650,7 @@ def strategic_first_attempt(
         )
 
         def _maybe_switch_to_backup(handle, token, value, label: str, shot_no: int):
-            if ENABLE_TEXTCLICK and isinstance(handle, dict):
+            if (ENABLE_TEXTCLICK or ENABLE_ICONCLICK) and isinstance(handle, dict):
                 event = handle.get("event")
                 if event is not None and not event.is_set():
                     event.wait(timeout=0.5)
@@ -1655,7 +1680,7 @@ def strategic_first_attempt(
                     continue
                 backup_page_id = backup.get("seatPageId") or backup_room
                 backup_fid = backup.get("fidEnc") or fid_enc
-                if ENABLE_TEXTCLICK:
+                if ENABLE_TEXTCLICK or ENABLE_ICONCLICK:
                     backup_conflict = s.check_getusedtimes_conflict_sync(
                         times,
                         backup_room,
@@ -1744,7 +1769,7 @@ def strategic_first_attempt(
                         fallback_seat,
                     )
                     continue
-                if ENABLE_TEXTCLICK:
+                if ENABLE_TEXTCLICK or ENABLE_ICONCLICK:
                     fallback_conflict = s.check_getusedtimes_conflict_sync(
                         times,
                         fallback_base_room,
@@ -1813,7 +1838,9 @@ def strategic_first_attempt(
         # 连接预热：只有首个配置执行一次，后续配置直接复用已预热的连接池
         if is_primary_strategy_config and not warm_done:
             first_token_start_dt = _get_first_token_start_dt(target_dt)
-            captcha_enabled = bool(ENABLE_ROTATE or ENABLE_SLIDER or ENABLE_TEXTCLICK)
+            captcha_enabled = bool(
+                ENABLE_ROTATE or ENABLE_SLIDER or ENABLE_TEXTCLICK or ENABLE_ICONCLICK
+            )
             allow_early_warm_after_captcha = (
                 captcha_enabled and WARM_CONNECTION_LEAD_MS > 4500
             )
@@ -2285,7 +2312,7 @@ def login_and_reserve(
     users, usernames, passwords, action, success_list=None, sessions=None
 ):
     logging.info(
-        f"Global settings: \nSLEEPTIME: {SLEEPTIME}\nENDTIME: {ENDTIME}\nENABLE_SLIDER: {ENABLE_SLIDER}\nENABLE_TEXTCLICK: {ENABLE_TEXTCLICK}\nENABLE_ROTATE: {ENABLE_ROTATE}\nRESERVE_NEXT_DAY: {RESERVE_NEXT_DAY}"
+        f"Global settings: \nSLEEPTIME: {SLEEPTIME}\nENDTIME: {ENDTIME}\nENABLE_SLIDER: {ENABLE_SLIDER}\nENABLE_TEXTCLICK: {ENABLE_TEXTCLICK}\nENABLE_ICONCLICK: {ENABLE_ICONCLICK}\nENABLE_ROTATE: {ENABLE_ROTATE}\nRESERVE_NEXT_DAY: {RESERVE_NEXT_DAY}"
     )
 
     usernames_list, passwords_list = None, None
@@ -2353,6 +2380,7 @@ def login_and_reserve(
                         max_attempt=MAX_ATTEMPT,
                         enable_slider=ENABLE_SLIDER,
                         enable_textclick=ENABLE_TEXTCLICK,
+                        enable_iconclick=ENABLE_ICONCLICK,
                         enable_rotate=ENABLE_ROTATE,
                         reserve_next_day=RESERVE_NEXT_DAY,
                         reserve_day_offset=RESERVE_DAY_OFFSET,
@@ -2373,6 +2401,7 @@ def login_and_reserve(
                     max_attempt=MAX_ATTEMPT,
                     enable_slider=ENABLE_SLIDER,
                     enable_textclick=ENABLE_TEXTCLICK,
+                    enable_iconclick=ENABLE_ICONCLICK,
                     enable_rotate=ENABLE_ROTATE,
                     reserve_next_day=RESERVE_NEXT_DAY,
                     reserve_day_offset=RESERVE_DAY_OFFSET,
@@ -2559,7 +2588,7 @@ def main(users, action=False):
 
 def debug(users, action=False):
     logging.info(
-        f"Global settings: \nSLEEPTIME: {SLEEPTIME}\nENDTIME: {ENDTIME}\nENABLE_SLIDER: {ENABLE_SLIDER}\nENABLE_TEXTCLICK: {ENABLE_TEXTCLICK}\nENABLE_ROTATE: {ENABLE_ROTATE}\nRESERVE_NEXT_DAY: {RESERVE_NEXT_DAY}"
+        f"Global settings: \nSLEEPTIME: {SLEEPTIME}\nENDTIME: {ENDTIME}\nENABLE_SLIDER: {ENABLE_SLIDER}\nENABLE_TEXTCLICK: {ENABLE_TEXTCLICK}\nENABLE_ICONCLICK: {ENABLE_ICONCLICK}\nENABLE_ROTATE: {ENABLE_ROTATE}\nRESERVE_NEXT_DAY: {RESERVE_NEXT_DAY}"
     )
     suc = False
     logging.info(f" Debug Mode start! , action {'on' if action else 'off'}")
@@ -2617,6 +2646,7 @@ def debug(users, action=False):
             max_attempt=MAX_ATTEMPT,
             enable_slider=ENABLE_SLIDER,
             enable_textclick=ENABLE_TEXTCLICK,
+            enable_iconclick=ENABLE_ICONCLICK,
             enable_rotate=ENABLE_ROTATE,
             reserve_next_day=RESERVE_NEXT_DAY,
             reserve_day_offset=RESERVE_DAY_OFFSET,
@@ -2647,6 +2677,7 @@ def get_roomid(args1, args2):
         max_attempt=MAX_ATTEMPT,
         enable_slider=ENABLE_SLIDER,
         enable_textclick=ENABLE_TEXTCLICK,
+        enable_iconclick=ENABLE_ICONCLICK,
         enable_rotate=ENABLE_ROTATE,
         reserve_next_day=RESERVE_NEXT_DAY,
         reserve_day_offset=RESERVE_DAY_OFFSET,

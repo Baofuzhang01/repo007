@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import sys
@@ -16,7 +17,6 @@ import requests
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_EXPORT_PATH = PROJECT_ROOT / "tongyi-kv-export.json"
 DEFAULT_ENV_EXPORT_PATH = PROJECT_ROOT / "tongyi-env-migration.env"
-DEFAULT_EXCLUDED_EXPORT_PREFIXES = ["meta:heartbeat:"]
 
 SERVER_ENV_KEYS = [
     "CF_ACCOUNT_ID",
@@ -176,9 +176,16 @@ class CloudflareKV:
             )
         return response.content
 
-    def put_value_bytes(self, key: str, value: bytes, metadata: Any = None) -> None:
+    def put_value_bytes(
+        self,
+        key: str,
+        value: bytes,
+        metadata: Any = None,
+        expiration: int | None = None,
+    ) -> None:
         files = None
         headers = None
+        params = {"expiration": expiration} if expiration is not None else None
         if metadata is not None:
             files = {
                 "value": (None, value),
@@ -191,6 +198,7 @@ class CloudflareKV:
             data=value if files is None else None,
             files=files,
             headers=headers,
+            params=params,
             timeout=30,
         )
         if response.status_code >= 400:
@@ -200,15 +208,29 @@ class CloudflareKV:
 
 
 def build_source_client(args) -> CloudflareKV:
+    profiles = {
+        "source": (
+            "SOURCE_CF_ACCOUNT_ID",
+            "SOURCE_CF_KV_NAMESPACE_ID",
+            "SOURCE_CF_API_TOKEN",
+        ),
+        "current": ("CF_ACCOUNT_ID", "CF_KV_NAMESPACE_ID", "CF_API_TOKEN"),
+        "new": (
+            "NEW_CF_ACCOUNT_ID",
+            "NEW_CF_KV_NAMESPACE_ID",
+            "NEW_CF_API_TOKEN",
+        ),
+    }
+    account_env, namespace_env, token_env = profiles[args.source_profile]
     return CloudflareKV(
-        env_or_arg(args, "source_account_id", ["SOURCE_CF_ACCOUNT_ID", "CF_ACCOUNT_ID"], "source account id"),
+        env_or_arg(args, "source_account_id", account_env, "source account id"),
         env_or_arg(
             args,
             "source_namespace_id",
-            ["SOURCE_CF_KV_NAMESPACE_ID", "CF_KV_NAMESPACE_ID"],
+            namespace_env,
             "source KV namespace id",
         ),
-        env_or_arg(args, "source_api_token", ["SOURCE_CF_API_TOKEN", "CF_API_TOKEN"], "source API token"),
+        env_or_arg(args, "source_api_token", token_env, "source API token"),
     )
 
 
@@ -236,18 +258,158 @@ def selected_keys(
     return result
 
 
+def stable_key_list(
+    source: CloudflareKV,
+    include_prefixes: list[str],
+    exclude_prefixes: list[str],
+    attempts: int = 6,
+) -> list[dict[str, Any]]:
+    previous: list[dict[str, Any]] | None = None
+    previous_names: list[str] | None = None
+    for _attempt in range(attempts):
+        current = selected_keys(source.list_keys(), include_prefixes, exclude_prefixes)
+        current.sort(key=lambda item: str(item.get("name") or ""))
+        current_names = [str(item.get("name") or "") for item in current]
+        if current_names == previous_names:
+            return current
+        previous = current
+        previous_names = current_names
+        time.sleep(1)
+    raise SystemExit(
+        f"source KV key listing did not stabilize after {attempts} attempts; "
+        f"last count={len(previous_names or [])}"
+    )
+
+
+def record_digest(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def manifest_digest(records: list[dict[str, Any]]) -> str:
+    manifest = [
+        {
+            "key": record["key"],
+            "sha256": record["sha256"],
+            "metadata": record.get("metadata"),
+            "expiration": record.get("expiration"),
+        }
+        for record in records
+    ]
+    encoded = json.dumps(
+        manifest,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def load_partial_export(
+    path: Path,
+    source: CloudflareKV,
+) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    source_info = payload.get("source") or {}
+    if (
+        payload.get("format") != "tongyi-cloudflare-kv-export-partial-v1"
+        or source_info.get("account_id") != source.account_id
+        or source_info.get("namespace_id") != source.namespace_id
+        or not isinstance(payload.get("records"), list)
+    ):
+        raise SystemExit(f"invalid or mismatched partial export: {path}")
+
+    records = payload["records"]
+    seen: set[str] = set()
+    for record in records:
+        key = str(record.get("key") or "")
+        encoded = record.get("value_base64")
+        if not key or not isinstance(encoded, str) or key in seen:
+            raise SystemExit(f"invalid partial export record: {key!r}")
+        seen.add(key)
+        value = base64.b64decode(encoded, validate=True)
+        if record.get("sha256") != record_digest(value):
+            raise SystemExit(f"partial export checksum mismatch for key {key!r}")
+    return records
+
+
+def save_partial_export(
+    path: Path,
+    source: CloudflareKV,
+    records: list[dict[str, Any]],
+) -> None:
+    write_json_atomic(
+        path,
+        {
+            "format": "tongyi-cloudflare-kv-export-partial-v1",
+            "source": {
+                "account_id": source.account_id,
+                "namespace_id": source.namespace_id,
+            },
+            "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "key_count": len(records),
+            "records": records,
+        },
+    )
+
+
+def load_and_validate_export(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    records = payload.get("records")
+    if payload.get("format") != "tongyi-cloudflare-kv-export-v2" or not isinstance(records, list):
+        raise SystemExit("invalid export file: expected tongyi-cloudflare-kv-export-v2")
+    if payload.get("key_count") != len(records):
+        raise SystemExit("invalid export file: key_count does not match records")
+
+    seen: set[str] = set()
+    for record in records:
+        key = str(record.get("key") or "")
+        encoded = record.get("value_base64")
+        if not key or not isinstance(encoded, str) or key in seen:
+            raise SystemExit(f"invalid export record: missing/duplicate key {key!r}")
+        seen.add(key)
+        try:
+            value = base64.b64decode(encoded, validate=True)
+        except ValueError as error:
+            raise SystemExit(f"invalid base64 for key {key!r}: {error}") from error
+        if record.get("sha256") != record_digest(value):
+            raise SystemExit(f"checksum mismatch in export file for key {key!r}")
+
+    if payload.get("manifest_sha256") != manifest_digest(records):
+        raise SystemExit("invalid export file: manifest checksum mismatch")
+    return payload, records
+
+
 def export_kv(args) -> None:
     source = build_source_client(args)
     output_path = Path(args.output).expanduser()
+    partial_path = output_path.with_name(f"{output_path.name}.partial")
     include_prefixes = args.prefix or []
-    exclude_prefixes = [] if args.include_heartbeat else DEFAULT_EXCLUDED_EXPORT_PREFIXES + (args.exclude_prefix or [])
+    exclude_prefixes = args.exclude_prefix or []
 
-    keys = selected_keys(source.list_keys(), include_prefixes, exclude_prefixes)
-    records: list[dict[str, Any]] = []
+    keys = stable_key_list(source, include_prefixes, exclude_prefixes)
+    initial_names = [str(item.get("name") or "") for item in keys if item.get("name")]
+    initial_name_set = set(initial_names)
+    records = load_partial_export(partial_path, source)
+    records = [record for record in records if record["key"] in initial_name_set]
+    completed_keys = {str(record["key"]) for record in records}
+    if records:
+        print(f"resuming from {len(records)} saved keys in {partial_path}", file=sys.stderr)
     started = time.time()
     for index, item in enumerate(keys, start=1):
         key = str(item.get("name") or "")
-        if not key:
+        if not key or key in completed_keys:
             continue
         value = source.get_value_bytes(key)
         if value is None:
@@ -255,17 +417,31 @@ def export_kv(args) -> None:
         record = {
             "key": key,
             "value_base64": base64.b64encode(value).decode("ascii"),
+            "sha256": record_digest(value),
         }
         if "metadata" in item and item.get("metadata") is not None:
             record["metadata"] = item.get("metadata")
         if "expiration" in item and item.get("expiration") is not None:
             record["expiration"] = item.get("expiration")
         records.append(record)
+        completed_keys.add(key)
+        # Save after every successful sequential read so a retry never needs to
+        # spend the source read quota on already exported keys.
+        save_partial_export(partial_path, source, records)
         if index % 50 == 0:
             print(f"exported {index}/{len(keys)} keys...", file=sys.stderr)
 
+    records.sort(key=lambda record: record["key"])
+    final_keys = stable_key_list(source, include_prefixes, exclude_prefixes)
+    final_names = [str(item.get("name") or "") for item in final_keys if item.get("name")]
+    exported_names = [record["key"] for record in records]
+    if initial_names != final_names or initial_names != exported_names:
+        raise SystemExit(
+            "source KV changed during export; pause Worker writes and run export again"
+        )
+
     payload = {
-        "format": "tongyi-cloudflare-kv-export-v1",
+        "format": "tongyi-cloudflare-kv-export-v2",
         "exported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "source": {
             "account_id": source.account_id,
@@ -273,9 +449,11 @@ def export_kv(args) -> None:
         },
         "key_count": len(records),
         "excluded_prefixes": exclude_prefixes,
+        "manifest_sha256": manifest_digest(records),
         "records": records,
     }
-    output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json_atomic(output_path, payload)
+    partial_path.unlink(missing_ok=True)
     print(
         json.dumps(
             {
@@ -296,20 +474,29 @@ def import_kv(args) -> None:
         raise SystemExit("refusing to import without --yes")
     target = build_target_client(args)
     input_path = Path(args.input).expanduser()
-    payload = json.loads(input_path.read_text(encoding="utf-8"))
-    records = payload.get("records") or []
-    if not isinstance(records, list):
-        raise SystemExit("invalid export file: records must be a list")
+    payload, records = load_and_validate_export(input_path)
+    source_info = payload.get("source") or {}
+    if (
+        source_info.get("account_id") == target.account_id
+        and source_info.get("namespace_id") == target.namespace_id
+    ):
+        raise SystemExit("refusing to import back into the source KV namespace")
 
     started = time.time()
     imported = 0
     for index, record in enumerate(records, start=1):
         key = str(record.get("key") or "")
-        encoded = str(record.get("value_base64") or "")
-        if not key or not encoded:
+        encoded = record.get("value_base64")
+        if not key or not isinstance(encoded, str):
             continue
         value = base64.b64decode(encoded)
-        target.put_value_bytes(key, value, metadata=record.get("metadata"))
+        expiration = record.get("expiration")
+        target.put_value_bytes(
+            key,
+            value,
+            metadata=record.get("metadata"),
+            expiration=int(expiration) if expiration is not None else None,
+        )
         imported += 1
         if index % 50 == 0:
             print(f"imported {index}/{len(records)} keys...", file=sys.stderr)
@@ -330,19 +517,39 @@ def import_kv(args) -> None:
     )
 
 
+def check_export(args) -> None:
+    input_path = Path(args.input).expanduser()
+    payload, records = load_and_validate_export(input_path)
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "action": "check",
+                "input": str(input_path),
+                "keys": len(records),
+                "manifest_sha256": payload["manifest_sha256"],
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
 def verify_kv(args) -> None:
     target = build_target_client(args)
     input_path = Path(args.input).expanduser()
-    payload = json.loads(input_path.read_text(encoding="utf-8"))
-    records = payload.get("records") or []
+    _payload, records = load_and_validate_export(input_path)
+    target_keys = {str(item.get("name") or ""): item for item in target.list_keys()}
+    expected_names = {str(record["key"]) for record in records}
     checked = 0
     missing: list[str] = []
     different: list[str] = []
+    metadata_different: list[str] = []
+    expiration_different: list[str] = []
 
     for record in records:
         key = str(record.get("key") or "")
-        encoded = str(record.get("value_base64") or "")
-        if not key or not encoded:
+        encoded = record.get("value_base64")
+        if not key or not isinstance(encoded, str):
             continue
         expected = base64.b64decode(encoded)
         actual = target.get_value_bytes(key)
@@ -351,16 +558,26 @@ def verify_kv(args) -> None:
             missing.append(key)
         elif actual != expected:
             different.append(key)
+        target_item = target_keys.get(key) or {}
+        if target_item.get("metadata") != record.get("metadata"):
+            metadata_different.append(key)
+        if target_item.get("expiration") != record.get("expiration"):
+            expiration_different.append(key)
 
+    extra = sorted(set(target_keys) - expected_names) if args.exact else []
     result = {
-        "ok": not missing and not different,
+        "ok": not missing and not different and not metadata_different
+        and not expiration_different and not extra,
         "action": "verify",
         "checked": checked,
         "missing": missing,
         "different": different,
+        "metadata_different": metadata_different,
+        "expiration_different": expiration_different,
+        "extra": extra,
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    if missing or different:
+    if not result["ok"]:
         raise SystemExit(1)
 
 
@@ -441,6 +658,12 @@ def env_export(args) -> None:
 
 
 def add_common_source_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--source-profile",
+        choices=["source", "current", "new"],
+        default="source",
+        help="Environment variable set to use: SOURCE_CF_*, CF_*, or NEW_CF_*.",
+    )
     parser.add_argument("--source-account-id", default="")
     parser.add_argument("--source-namespace-id", default="")
     parser.add_argument("--source-api-token", default="")
@@ -470,12 +693,7 @@ def main() -> None:
         "--exclude-prefix",
         action="append",
         default=[],
-        help="Exclude keys with this prefix. Repeatable. meta:heartbeat: is excluded by default.",
-    )
-    export_parser.add_argument(
-        "--include-heartbeat",
-        action="store_true",
-        help="Include meta:heartbeat:* keys. By default heartbeat keys are skipped.",
+        help="Exclude keys with this prefix. Repeatable. Omit to export every key.",
     )
     export_parser.set_defaults(func=export_kv)
 
@@ -485,9 +703,21 @@ def main() -> None:
     import_parser.add_argument("--yes", action="store_true", help="Required confirmation for writes")
     import_parser.set_defaults(func=import_kv)
 
+    check_parser = subparsers.add_parser(
+        "check",
+        help="Validate every value checksum and the manifest without Cloudflare access",
+    )
+    check_parser.add_argument("--input", default=str(DEFAULT_EXPORT_PATH))
+    check_parser.set_defaults(func=check_export)
+
     verify_parser = subparsers.add_parser("verify", help="Compare target KV values against a JSON export")
     add_common_target_args(verify_parser)
     verify_parser.add_argument("--input", default=str(DEFAULT_EXPORT_PATH))
+    verify_parser.add_argument(
+        "--exact",
+        action="store_true",
+        help="Also fail if the target contains keys absent from the export.",
+    )
     verify_parser.set_defaults(func=verify_kv)
 
     env_parser = subparsers.add_parser("env-export", help="Generate a target env template from a local env file")

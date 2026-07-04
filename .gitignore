@@ -172,7 +172,7 @@ html_debug/
 # 本地配置（包含敏感信息）
 config.json
 utils/config.json
-tongyi-kv-export.json
+tongyi-kv-export.json*
 seat-qianduan.env.local
 seat-qianduan.env.example
 worker2/wrangler.toml
