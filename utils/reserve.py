@@ -271,6 +271,8 @@ class reserve:
         self.submit_msg = []
         self.last_submit_result = None
         self.rotate_captcha_processed_count = 0
+        self._rotate_normal_reusable_captcha = ""
+        self._rotate_normal_consumed_captcha_count = 0
         self._used_submit_values = set()
         self._used_submit_values_lock = threading.Lock()
         self.requests = requests.session()
@@ -2426,8 +2428,6 @@ class reserve:
                 )
 
         suc = False
-        rotate_reusable_captcha = ""
-        rotate_consumed_captcha_count = 0
         for slot in candidate_slots:
             slot_roomid = slot["roomid"]
             seat = slot["seatid"]
@@ -2464,8 +2464,8 @@ class reserve:
                 # 根据开关决定使用哪种验证码（两种验证码可以同时开启）
                 captcha = ""
                 if self.enable_rotate:
-                    if not rotate_reusable_captcha:
-                        if rotate_consumed_captcha_count >= type(self).rotate_normal_consumed_captcha_limit:
+                    if not self._rotate_normal_reusable_captcha:
+                        if self._rotate_normal_consumed_captcha_count >= type(self).rotate_normal_consumed_captcha_limit:
                             logging.warning(
                                 "旋转模式普通候补已达到最多消费 %d 个有效验证码的预算，停止候补",
                                 type(self).rotate_normal_consumed_captcha_limit,
@@ -2474,15 +2474,18 @@ class reserve:
                         logging.info(
                             "普通候补流程：先获取有效旋转滑块验证码，再检查座位是否空闲；"
                             "有效验证码消费预算 %d/%d",
-                            rotate_consumed_captcha_count,
+                            self._rotate_normal_consumed_captcha_count,
                             type(self).rotate_normal_consumed_captcha_limit,
                         )
-                        rotate_reusable_captcha = self._resolve_rotate_captcha_with_retry(max_attempts=3)
+                        self._rotate_normal_reusable_captcha = self._resolve_rotate_captcha_with_retry(max_attempts=3)
                     else:
                         logging.info(
-                            "普通候补流程：复用未提交消费的旋转滑块验证码，先查当前候补座位是否空闲"
+                            "普通候补流程：跨候补座位复用未提交消费的旋转滑块验证码，先查当前候补座位是否空闲；"
+                            "有效验证码消费预算 %d/%d",
+                            self._rotate_normal_consumed_captcha_count,
+                            type(self).rotate_normal_consumed_captcha_limit,
                         )
-                    captcha = rotate_reusable_captcha
+                    captcha = self._rotate_normal_reusable_captcha
                     logging.info("旋转滑块验证码令牌：%s", captcha)
                     if not captcha:
                         logging.warning(
@@ -2580,17 +2583,17 @@ class reserve:
                 if suc:
                     return suc
                 if self.enable_rotate and captcha:
-                    rotate_consumed_captcha_count += 1
-                    rotate_reusable_captcha = ""
+                    self._rotate_normal_consumed_captcha_count += 1
+                    self._rotate_normal_reusable_captcha = ""
                     logging.info(
                         "旋转滑块验证码已用于提交但未成功，按已消费处理：%d/%d",
-                        rotate_consumed_captcha_count,
+                        self._rotate_normal_consumed_captcha_count,
                         type(self).rotate_normal_consumed_captcha_limit,
                     )
-                    if rotate_consumed_captcha_count >= type(self).rotate_normal_consumed_captcha_limit:
+                    if self._rotate_normal_consumed_captcha_count >= type(self).rotate_normal_consumed_captcha_limit:
                         logging.warning(
                             "旋转模式普通候补已消费 %d 个有效验证码仍未成功，停止候补",
-                            rotate_consumed_captcha_count,
+                            self._rotate_normal_consumed_captcha_count,
                         )
                         return suc
                 if self.enable_textclick and type(self).textclick_normal_request_count >= type(self).textclick_normal_request_limit:
