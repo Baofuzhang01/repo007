@@ -1839,6 +1839,7 @@ class reserve:
 
         def _download(url: str, label: str):
             display_label = "圆图" if label == "shade" else "背景图"
+            started_at = time.monotonic()
             try:
                 resp = self._get(
                     url,
@@ -1848,9 +1849,21 @@ class reserve:
                     request_name=f"rotate {label} image download",
                 )
                 resp.raise_for_status()
-                return resp.content
+                content = resp.content
+                logging.info(
+                    "旋转滑块%s下载完成：耗时=%.3f秒，字节数=%d",
+                    display_label,
+                    time.monotonic() - started_at,
+                    len(content),
+                )
+                return content
             except Exception as e:
-                logging.warning("下载旋转滑块%s失败：%s", display_label, e)
+                logging.warning(
+                    "下载旋转滑块%s失败：耗时=%.3f秒，错误=%s",
+                    display_label,
+                    time.monotonic() - started_at,
+                    e,
+                )
                 return None
 
         shade_bytes = _download(shade_url, "shade")
@@ -1873,7 +1886,7 @@ class reserve:
             ocr = TulingCloudOCR(username=username, password=password, model_id=model_id)
             return ocr.solve_rotate_x(shade_bytes, cutout_bytes)
         except Exception as e:
-            logging.debug("旋转滑块 OCR 失败：%s", e)
+            logging.warning("旋转滑块 OCR 失败：%s", e)
             return None
 
     def _recognize_textclick_positions(self, image_url, target_text):

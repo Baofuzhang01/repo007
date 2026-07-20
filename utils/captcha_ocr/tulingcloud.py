@@ -8,6 +8,7 @@ import io
 import json
 import logging
 import re
+import time
 from typing import Optional
 
 from PIL import Image, ImageDraw
@@ -276,28 +277,52 @@ class TulingCloudOCR:
         """识别超星 rotate 验证码，返回“小圆顺时针旋转度数”。"""
         try:
             import requests
+        except ImportError as e:
+            logging.warning("图灵云 rotate OCR 请求失败：缺少 requests，错误=%s", e)
+            return None
 
-            payload = {
-                "username": self.username,
-                "password": self.password,
-                "ID": self.model_id,
-                "b64": base64.b64encode(image_bytes).decode("ascii"),
-                "version": "3.1.1",
-            }
+        payload = {
+            "username": self.username,
+            "password": self.password,
+            "ID": self.model_id,
+            "b64": base64.b64encode(image_bytes).decode("ascii"),
+            "version": "3.1.1",
+        }
+        started_at = time.monotonic()
+        try:
             response = requests.post(
                 self.TULINGCLOUD_API_URL,
                 data=json.dumps(payload),
                 timeout=15,
             )
-            result = response.json()
-            logging.debug("TulingCloud rotate API response: %s", result)
         except Exception as e:
-            logging.debug("TulingCloud rotate recognition request failed: %s", e)
+            logging.warning(
+                "图灵云 rotate OCR 请求失败：耗时=%.3f秒，错误=%s",
+                time.monotonic() - started_at,
+                e,
+            )
             return None
+        elapsed = time.monotonic() - started_at
+        logging.info(
+            "图灵云 rotate OCR 请求完成：HTTP %s，耗时=%.3f秒",
+            response.status_code,
+            elapsed,
+        )
+        try:
+            result = response.json()
+        except Exception as e:
+            logging.warning(
+                "图灵云 rotate OCR 响应解析失败：HTTP %s，耗时=%.3f秒，错误=%s",
+                response.status_code,
+                elapsed,
+                e,
+            )
+            return None
+        logging.debug("TulingCloud rotate API response: %s", result)
 
         if result.get("code") not in {0, 1}:
-            logging.debug(
-                "TulingCloud rotate recognition failed: code=%s message=%s",
+            logging.warning(
+                "图灵云 rotate 识别失败：code=%s，message=%s",
                 result.get("code"),
                 result.get("message") or result.get("msg"),
             )
@@ -306,13 +331,13 @@ class TulingCloudOCR:
         data = result.get("data") or {}
         angle = data.get("小圆顺时针旋转度数")
         if angle is None:
-            logging.debug("TulingCloud rotate response has no angle field: %s", result)
+            logging.warning("图灵云 rotate 响应缺少角度字段：%s", result)
             return None
 
         try:
             return float(angle)
         except (TypeError, ValueError):
-            logging.debug("TulingCloud rotate angle is not numeric: %r", angle)
+            logging.warning("图灵云 rotate 角度不是数字：%r", angle)
             return None
 
     def solve_rotate_x(
@@ -324,7 +349,7 @@ class TulingCloudOCR:
         try:
             composed_image = self.compose_rotate_image(shade_bytes, cutout_bytes)
         except Exception as e:
-            logging.debug("Failed to compose rotate captcha image: %s", e)
+            logging.warning("合成 rotate 验证码图片失败：%s", e)
             return None
 
         angle = self.recognize_rotate_angle(composed_image)
